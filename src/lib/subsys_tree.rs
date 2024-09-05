@@ -4,17 +4,12 @@ use std::time::Duration;
 use axum::async_trait;
 use futures_util::future::BoxFuture;
 use futures_util::{Future, FutureExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-#[async_trait]
-pub trait TreeLogic: Send + Sync + 'static {
-    fn run(&self);
-}
-
 pub struct SubsystemNode {
-    token: CancellationToken,
+    notify: Arc<Notify>,
     task_handle: Option<JoinHandle<()>>,
     children: Vec<Arc<Mutex<SubsystemNode>>>,
 }
@@ -22,13 +17,13 @@ pub struct SubsystemNode {
 impl SubsystemNode {
     pub fn new_root<F>(fut: F, interval: Duration) -> Self
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
     {
-        let token = CancellationToken::new();
-        let task_handle = Some(Self::spawn_task(token.clone(), fut, interval));
+        let notify = Arc::new(Notify::new());
+        let task_handle = Some(Self::spawn_task(notify.clone(), fut, interval));
 
         SubsystemNode {
-            token,
+            notify,
             task_handle,
             children: vec![],
         }
@@ -36,13 +31,13 @@ impl SubsystemNode {
 
     pub fn new_child<F>(&mut self, fut: F, interval: Duration) -> Arc<Mutex<Self>>
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
     {
-        let token = self.token.child_token();
-        let task_handle = Some(Self::spawn_task(token.clone(), fut, interval));
+        let notify = Arc::new(Notify::new());
+        let task_handle = Some(Self::spawn_task(notify.clone(), fut, interval));
 
         let child = Arc::new(Mutex::new(SubsystemNode {
-            token,
+            notify,
             task_handle,
             children: vec![],
         }));
@@ -55,34 +50,49 @@ impl SubsystemNode {
         self.children.push(child);
     }
 
-    fn spawn_task<F>(token: CancellationToken, fut: F, interval: Duration) -> JoinHandle<()>
+    fn spawn_task<F>(notify: Arc<Notify>, fut_gen: F, interval: Duration) -> JoinHandle<()>
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Fn() -> BoxFuture<'static, ()> + Send + 'static,
     {
         tokio::spawn(async move {
-            tokio::select! {
-                _ = fut => {
-                    println!("Task done");
-                }
-                _ = token.cancelled() => {
-                    println!("Shutting down with token");
-                    return;
+            loop {
+                println!("Entering loop");
+                let fut = fut_gen();
+                fut.await;
+
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        println!("Time elapsed");
+                    }
+                    _ = notify.notified() => {
+                        println!("Shutting down with notify for {interval:?}");
+                        return;
+                    }
                 }
             }
         })
     }
 
     pub fn shutdown(&mut self) -> BoxFuture<'_, ()> {
-        self.token.cancel();
+        println!("Trigger shutdown");
 
         async move {
-            for child in &self.children {
-                let mut child_lock = child.lock().await;
-                child_lock.shutdown().await;
+            // First, trigger the shutdown by notifying the task
+            self.notify.notify_one();
+
+            // Wait for the parent task to complete
+            if let Some(handle) = self.task_handle.take() {
+                println!("Waiting for parent task to complete...");
+                let _ = handle.await;
+                println!("Parent task completed");
             }
 
-            if let Some(handle) = self.task_handle.take() {
-                let _ = handle.await;
+            // After parent has completed, shutdown all the children
+            for child in &self.children {
+                let mut child_lock = child.lock().await;
+                println!("Shutting down child...");
+                child_lock.shutdown().await;
+                println!("Child shutdown completed");
             }
         }
         .boxed()
